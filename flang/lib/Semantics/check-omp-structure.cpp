@@ -3816,6 +3816,58 @@ void OmpStructureChecker::Enter(const parser::OmpClause::TaskReduction &x) {
   CheckReductionObjects(objects, llvm::omp::Clause::OMPC_task_reduction);
 }
 
+// Find user reduction details for a mangled name, following USE associations
+// if the reduction is not directly visible in the scope.
+static const UserReductionDetails *FindUserReduction(
+    const Scope &scope, const parser::CharBlock &mangledName) {
+  // Direct lookup: works for bare USE or local declarations.
+  if (const auto *symbol{scope.FindSymbol(mangledName)}) {
+    const auto &ultimate{symbol->GetUltimate()};
+    if (const auto *details{ultimate.detailsIf<UserReductionDetails>()}) {
+      return details;
+    }
+  }
+  // Fallback: the operator/procedure was imported via USE...ONLY but the
+  // internal reduction symbol was not. Trace through the operator symbol
+  // to its source module scope.
+  std::string fortranName{GetReductionFortranId(mangledName)};
+  if (fortranName.empty()) {
+    return nullptr;
+  }
+  auto *opSymbol{scope.FindSymbol(fortranName)};
+  if (!opSymbol) {
+    return nullptr;
+  }
+  // Try following UseDetails/HostAssocDetails to the source module.
+  const Symbol &ultimate{opSymbol->GetUltimate()};
+  const Scope &sourceScope{ultimate.owner()};
+  if (sourceScope.kind() == Scope::Kind::Module) {
+    auto it{sourceScope.find(mangledName)};
+    if (it != sourceScope.end()) {
+      const Symbol &reductionSym{it->second->GetUltimate()};
+      if (!reductionSym.attrs().test(Attr::PRIVATE)) {
+        return reductionSym.detailsIf<UserReductionDetails>();
+      }
+    }
+  }
+  // Handle merged generics (operator imported from multiple modules).
+  if (const auto *generic{opSymbol->detailsIf<GenericDetails>()}) {
+    for (const Symbol &useSym : generic->uses()) {
+      const Scope &modScope{useSym.GetUltimate().owner()};
+      if (modScope.kind() == Scope::Kind::Module) {
+        auto it{modScope.find(mangledName)};
+        if (it != modScope.end()) {
+          const Symbol &reductionSym{it->second->GetUltimate()};
+          if (!reductionSym.attrs().test(Attr::PRIVATE)) {
+            return reductionSym.detailsIf<UserReductionDetails>();
+          }
+        }
+      }
+    }
+  }
+  return nullptr;
+}
+
 bool OmpStructureChecker::CheckReductionOperator(
     const parser::OmpReductionIdentifier &ident, parser::CharBlock source,
     llvm::omp::Clause clauseId) {
@@ -3846,10 +3898,8 @@ bool OmpStructureChecker::CheckReductionOperator(
     if (const auto *definedOp{std::get_if<parser::DefinedOpName>(&dOpr.u)}) {
       std::string mangled{MangleDefinedOperator(definedOp->v.symbol->name())};
       const Scope &scope{definedOp->v.symbol->owner()};
-      if (const Symbol *symbol{scope.FindSymbol(mangled)}) {
-        if (symbol->GetUltimate().detailsIf<UserReductionDetails>()) {
-          return true;
-        }
+      if (FindUserReduction(scope, mangled)) {
+        return true;
       }
     }
     context_.Say(source, "Invalid reduction operator in %s clause."_err_en_US,
@@ -3947,30 +3997,8 @@ void OmpStructureChecker::CheckReductionObjects(
 
 static bool CheckSymbolSupportsType(const Scope &scope,
     const parser::CharBlock &name, const DeclTypeSpec &type) {
-  if (const auto *symbol{scope.FindSymbol(name)}) {
-    const auto &ultimate{symbol->GetUltimate()};
-    if (const auto *reductionDetails{
-            ultimate.detailsIf<UserReductionDetails>()}) {
-      return reductionDetails->SupportsType(type);
-    }
-  }
-  // Look through module scopes in the global scope.
-  // This covers reductions declared in a module and used via USE association.
-  const SemanticsContext &semCtx{scope.context()};
-  Scope &global = const_cast<SemanticsContext &>(semCtx).globalScope();
-  for (const Scope &child : global.children()) {
-    if (child.kind() == Scope::Kind::Module) {
-      if (const auto *symbol{child.FindSymbol(name)}) {
-        // Skip PRIVATE reductions that aren't visible in the current scope.
-        if (symbol->attrs().test(Attr::PRIVATE)) {
-          continue;
-        }
-        if (const auto *reductionDetails{
-                symbol->detailsIf<UserReductionDetails>()}) {
-          return reductionDetails->SupportsType(type);
-        }
-      }
-    }
+  if (const auto *details{FindUserReduction(scope, name)}) {
+    return details->SupportsType(type);
   }
   return false;
 }
